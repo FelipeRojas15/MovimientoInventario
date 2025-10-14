@@ -13,6 +13,14 @@ dynamodb = boto3.resource(
     **config.AWS_CONFIG
 )
 
+
+def safe_json_deserializer(v):
+    try:
+        return json.loads(v.decode('utf-8'))
+    except Exception as e:
+        print(f"⚠️ Mensaje inválido recibido: {v} – {e}")
+        return None
+
 # Usa las variables de config
 consumer = KafkaConsumer(
     'FallaCadenaDeFrio',
@@ -21,17 +29,19 @@ consumer = KafkaConsumer(
     auto_offset_reset='earliest',
     enable_auto_commit=True,
     group_id=config.KAFKA_GROUP_ID,
-    value_deserializer=lambda v: json.loads(v.decode('utf-8'))
+    value_deserializer=safe_json_deserializer
 )
 producer = KafkaProducer(
     bootstrap_servers=config.KAFKA_BOOTSTRAP_SERVERS,
     value_serializer=lambda v: json.dumps(v).encode('utf-8')
 )
-print("🟢 Esperando mensajes brafe...\n")
+print("🟢 Esperando mensajes...\n")
 
 # Procesar mensajes según el tópico
 
 for message in consumer:
+    if message.value is None:
+        continue
     try:
         if message.topic == "FallaCadenaDeFrio":
             print("📩 Mensaje recibido en FallaCadenaDeFrio:", message.value)
