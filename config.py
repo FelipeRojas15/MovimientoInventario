@@ -19,3 +19,8 @@ DYNAMODB_TABLES = {
     'PRODUCTO': 'Producto',
     'MOVIMIENTO_INVENTARIO': 'MovimientoInventario'
 }
+
+SERVER_CONFIG = {
+    'HOST': os.environ.get('SERVER_HOST', '0.0.0.0'),
+    'PORT': int(os.environ.get('SERVER_PORT', 8080))
+}

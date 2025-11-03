@@ -1,3 +1,5 @@
 kafka-python
 boto3
 python-dotenv
+fastapi
+uvicorn
