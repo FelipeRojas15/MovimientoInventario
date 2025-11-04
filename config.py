@@ -20,7 +20,4 @@ DYNAMODB_TABLES = {
     'MOVIMIENTO_INVENTARIO': 'MovimientoInventario'
 }
 
-SERVER_CONFIG = {
-    'HOST': os.environ.get('SERVER_HOST', '0.0.0.0'),
-    'PORT': int(os.environ.get('SERVER_PORT', 8080))
-}
+SERVICE_URL = os.environ.get('SERVICE_URL', 'http://localhost:8080/api/v1/transaccion/registrar')

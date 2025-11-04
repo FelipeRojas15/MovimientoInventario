@@ -1,17 +1,51 @@
-from kafka import KafkaConsumer, KafkaProducer
+from kafka import KafkaConsumer
+from kafka import KafkaProducer
 import json
 import boto3
 import uuid
 from datetime import datetime
 from decimal import Decimal
-import threading
 import config
-from fastapi import FastAPI, Request
-import uvicorn
+import requests
+
+# Inicializa DynamoDB
+dynamodb = boto3.resource(
+    'dynamodb',
+    **config.AWS_CONFIG
+)
 
 
-dynamodb = boto3.resource('dynamodb', **config.AWS_CONFIG)
+def safe_json_deserializer(v):
+    try:
+        return json.loads(v.decode('utf-8'))
+    except Exception as e:
+        print(f"Mensaje inválido recibido: {v} – {e}")
+        return None
 
+def enviar_evento_a_servicio(tipo_evento, producto_id, datos_evento, actor_emisor="Sistema XYZ"):
+    try:
+        payload = {
+            "tipoEvento": tipo_evento,
+            "idProducto": producto_id,
+            "datosEvento": json.dumps(datos_evento), 
+            "actorEmisor": actor_emisor
+        }
+
+        response = requests.post(
+            config.SERVICE_URL,
+            headers={"Content-Type": "application/json"},
+            data=json.dumps(payload)
+        )
+
+        if response.status_code == 200:
+            print(f"Evento enviado exitosamente al servicio: {payload}")
+        else:
+            print(f"Error al enviar evento al servicio ({response.status_code}): {response.text}")
+
+    except Exception as e:
+        print(f"Error al llamar al servicio: {e}")
+
+# Usa las variables de config
 consumer = KafkaConsumer(
     'FallaCadenaDeFrio',
     'InventarioActualizado',
@@ -19,149 +53,169 @@ consumer = KafkaConsumer(
     auto_offset_reset='earliest',
     enable_auto_commit=True,
     group_id=config.KAFKA_GROUP_ID,
-    value_deserializer=lambda v: json.loads(v.decode('utf-8')) if v else None
+    value_deserializer=safe_json_deserializer
 )
-
 producer = KafkaProducer(
     bootstrap_servers=config.KAFKA_BOOTSTRAP_SERVERS,
     value_serializer=lambda v: json.dumps(v).encode('utf-8')
 )
+print("🟢 Esperando mensajes...\n")
 
-def kafka_listener():
-    print("🟢 Esperando mensajes de Kafka...\n")
-    for message in consumer:
-        if message.value is None:
-            continue
-        try:
-            if message.topic == "FallaCadenaDeFrio":
-                procesar_falla_cadena(message.value)
-            elif message.topic == "InventarioActualizado":
-                procesar_inventario_actualizado(message.value)
-        except Exception as e:
-            print(f"🚨 Error procesando mensaje: {message.value} -> {e}")
-            continue
+# Procesar mensajes según el tópico
 
+for message in consumer:
+    if message.value is None:
+        continue
+    try:
+        if message.topic == "FallaCadenaDeFrio":
+            print("📩 Mensaje recibido en FallaCadenaDeFrio:", message.value)
 
-def procesar_falla_cadena(data):
-    print("📩 Mensaje recibido en FallaCadenaDeFrio:", data)
+            # Validar existencia de clave productID
+            if 'productID' not in message.value:
+                print(f"⚠️ Mensaje ignorado: falta 'productID' en {message.value}")
+                continue
 
-    if 'productID' not in data:
-        print(f"⚠️ Mensaje ignorado: falta 'productID'")
-        return
+            product_id = message.value['productID']
 
-    tableProduct = dynamodb.Table('Producto')
-    response = tableProduct.scan(
-        FilterExpression='productID = :pid',
-        ExpressionAttributeValues={':pid': str(data['productID'])}
-    )
-    items = response.get('Items', [])
-    if not items:
-        print(f"❌ Producto con ID {data['productID']} no encontrado")
-        return
+            # Paso 1: Buscar el producto
+            tableProduct = dynamodb.Table('Producto')
+            response = tableProduct.scan(
+                FilterExpression='productID = :pid',
+                ExpressionAttributeValues={':pid': str(product_id)}
+            )
+            items = response.get('Items', [])
+            if not items:
+                print(f"❌ Producto con ID {product_id} no encontrado")
+                continue
 
-    producto = items[0]
-    nuevo_stock = producto['StockActual'] - Decimal('1')
+            producto = items[0]
+            nuevo_stock = producto['StockActual'] - Decimal('1')
+            if nuevo_stock < 5:
+                evento = {
+                    "productID": producto['productID'],
+                    "motivo": "Stock bajo después de FallaCadenaDeFrio"
+                }
+                producer.send('StockBajo', value=evento)
+                print(f"✅ Evento enviado a Kafka: {evento}")
+                enviar_evento_a_servicio(
+                    tipo_evento="fabricacion",
+                    producto_id=producto['productID'],
+                    datos_evento={
+                        "motivo": "Stock bajo después de FallaCadenaDeFrio",
+                        "stock": float(nuevo_stock),
+                        "fecha": str(datetime.now())
+                    },
+                    actor_emisor="Sistema XYZ"
+                )
 
-    if nuevo_stock < 5:
-        evento = {"productID": producto['productID'], "motivo": "Stock bajo después de FallaCadenaDeFrio"}
-        producer.send('StockBajo', value=evento)
-        print(f"✅ Evento enviado a Kafka: {evento}")
+            if nuevo_stock < 0:
+                print("⚠️ El stock no puede ser negativo")
+                continue
 
-    if nuevo_stock < 0:
-        print("⚠️ El stock no puede ser negativo")
-        return
+            # Actualizar StockActual
+            tableProduct.update_item(
+                Key={'productID': producto['productID']},
+                UpdateExpression='SET StockActual = :val',
+                ExpressionAttributeValues={':val': nuevo_stock}
+            )
+            print(f"🔄 Stock actualizado para {producto['nombre']} a {nuevo_stock}")
 
-    tableProduct.update_item(
-        Key={'productID': producto['productID']},
-        UpdateExpression='SET StockActual = :val',
-        ExpressionAttributeValues={':val': nuevo_stock}
-    )
-    print(f"🔄 Stock actualizado para {producto['nombre']} a {nuevo_stock}")
+            # Crear movimiento
+            tableMov = dynamodb.Table('MovimientoInventario')
+            response = tableMov.scan()
+            items = response.get('Items', [])
+            nuevo_num = max(
+                (int(item['movimientoID'][3:]) for item in items if item['movimientoID'].startswith('MOV')),
+                default=0
+            ) + 1
+            nuevo_movimientoID = f"MOV{nuevo_num:03d}"
 
-    registrar_movimiento('Fallo Cadena de Frio', 'Descuento por Falla', Decimal('1'), producto['productID'])
+            movimiento = {
+                'movimientoID': nuevo_movimientoID,
+                'tipoMovimiento': 'Fallo Cadena de Frio',
+                'motivo': 'Descuento por Falla',
+                'cantidad': Decimal('1'),
+                'fechaMovimiento': str(datetime.now()),
+                'usuarioResponsable': 'Sistema',
+                'productoID': producto['productID']
+            }
+            tableMov.put_item(Item=movimiento)
+            print(f"✅ Movimiento registrado: {movimiento}")
 
+            enviar_evento_a_servicio(
+                tipo_evento="recepcion",
+                producto_id=producto['productID'],
+                datos_evento={
+                    "movimiento": nuevo_movimientoID,
+                    "stockRestante": float(nuevo_stock),
+                    "fecha": str(datetime.now())
+                },
+                actor_emisor="Sistema XYZ"
+            )
 
-def procesar_inventario_actualizado(data):
-    print(f"📦 Inventario actualizado: {data}")
-    if 'productID' not in data or 'stock' not in data:
-        print(f"⚠️ Mensaje ignorado: faltan campos")
-        return
+        elif message.topic == "InventarioActualizado":
+            print(f"📦 Inventario actualizado: {message.value}")
 
-    tableProduct = dynamodb.Table('Producto')
-    response = tableProduct.scan(
-        FilterExpression='productID = :pid',
-        ExpressionAttributeValues={':pid': str(data['productID'])}
-    )
-    items = response.get('Items', [])
-    if not items:
-        print(f"❌ Producto con ID {data['productID']} no encontrado")
-        return
+            # Validar existencia de claves
+            if 'productID' not in message.value or 'stock' not in message.value:
+                print(f"⚠️ Mensaje ignorado: faltan campos en {message.value}")
+                continue
 
-    producto = items[0]
-    nuevo_stock = Decimal(str(data['stock']))
+            product_id = message.value['productID']
+            nuevo_stock = Decimal(str(message.value['stock']))
 
-    tableProduct.update_item(
-        Key={'productID': producto['productID']},
-        UpdateExpression='SET StockActual = :val',
-        ExpressionAttributeValues={':val': nuevo_stock}
-    )
-    print(f"🔄 Stock actualizado para {producto['nombre']} a {nuevo_stock}")
+            tableProduct = dynamodb.Table('Producto')
+            response = tableProduct.scan(
+                FilterExpression='productID = :pid',
+                ExpressionAttributeValues={':pid': str(product_id)}
+            )
+            items = response.get('Items', [])
+            if not items:
+                print(f"❌ Producto con ID {product_id} no encontrado")
+                continue
 
-    registrar_movimiento('Actualización Inventario', 'Actualización manual/external', nuevo_stock, producto['productID'])
+            producto = items[0]
+            tableProduct.update_item(
+                Key={'productID': producto['productID']},
+                UpdateExpression='SET StockActual = :val',
+                ExpressionAttributeValues={':val': nuevo_stock}
+            )
+            print(f"🔄 Stock actualizado para {producto['nombre']} a {nuevo_stock}")
 
+            tableMov = dynamodb.Table('MovimientoInventario')
+            response = tableMov.scan()
+            items = response.get('Items', [])
+            nuevo_num = max(
+                (int(item['movimientoID'][3:]) for item in items if item['movimientoID'].startswith('MOV')),
+                default=0
+            ) + 1
+            nuevo_movimientoID = f"MOV{nuevo_num:03d}"
 
-def registrar_movimiento(tipo, motivo, cantidad, productoID):
-    tableMov = dynamodb.Table('MovimientoInventario')
-    response = tableMov.scan()
-    items = response.get('Items', [])
-    nuevo_num = max(
-        (int(item['movimientoID'][3:]) for item in items if item['movimientoID'].startswith('MOV')),
-        default=0
-    ) + 1
-    nuevo_movimientoID = f"MOV{nuevo_num:03d}"
+            movimiento = {
+                'movimientoID': nuevo_movimientoID,
+                'tipoMovimiento': 'Actualización Inventario',
+                'motivo': 'Actualización manual/external',
+                'cantidad': nuevo_stock,
+                'fechaMovimiento': str(datetime.now()),
+                'usuarioResponsable': 'Sistema',
+                'productoID': producto['productID']
+            }
+            tableMov.put_item(Item=movimiento)
+            print(f"✅ Movimiento registrado: {movimiento}")
 
-    movimiento = {
-        'movimientoID': nuevo_movimientoID,
-        'tipoMovimiento': tipo,
-        'motivo': motivo,
-        'cantidad': cantidad,
-        'fechaMovimiento': str(datetime.now()),
-        'usuarioResponsable': 'Sistema',
-        'productoID': productoID
-    }
-    tableMov.put_item(Item=movimiento)
-    print(f"✅ Movimiento registrado: {movimiento}")
+            enviar_evento_a_servicio(
+                tipo_evento="distribucion",
+                producto_id=producto['productID'],
+                datos_evento={
+                    "nuevoStock": float(nuevo_stock),
+                    "fecha": str(datetime.now())
+                },
+                actor_emisor="Sistema XYZ"
+            )
 
+    except Exception as e:
+        print(f"🚨 Error procesando mensaje: {message.value} -> {e}")
+        continue  # Saltar al siguiente mensaje
 
-app = FastAPI()
-
-@app.post("/api/v1/transaccion/registrar")
-async def registrar_transaccion(request: Request):
-    body = await request.json()
-    required = ["tipoEvento", "idProducto", "datosEvento", "actorEmisor"]
-    for campo in required:
-        if campo not in body:
-            return {"error": f"Falta el campo '{campo}'"}
-
-    transaccion_id = str(uuid.uuid4())
-    item = {
-        "transaccionID": transaccion_id,
-        "tipoEvento": body["tipoEvento"],
-        "idProducto": body["idProducto"],
-        "datosEvento": body["datosEvento"],
-        "actorEmisor": body["actorEmisor"],
-        "fechaRegistro": str(datetime.now())
-    }
-
-    table = dynamodb.Table('Transacciones')
-    table.put_item(Item=item)
-    print(f"✅ Transacción registrada: {item}")
-
-    return {"message": "Transacción registrada exitosamente", "transaccionID": transaccion_id}
-
-
-
-if __name__ == "__main__":
-    t = threading.Thread(target=kafka_listener, daemon=True)
-    t.start()
-    uvicorn.run(app, host=config.SERVER_CONFIG['HOST'], port=config.SERVER_CONFIG['PORT'])
+producer.flush()
+producer.close()
